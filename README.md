@@ -88,7 +88,7 @@ _The app’s "Metrics" tab includes both the numbers and beginner-friendly expla
     shiny::runApp("app.R")
     ```
 
-Make sure the prediction and metrics files (`QB_Preds.parquet`, `RB_Metrics.parquet`, etc.) are saved in the app directory. You can regenerate them using the modeling scripts (`QB_Stat_Pred.Rmd`, `RB_Stat_Pred.Rmd`, `WR_TE_Stat_Pred.Rmd`).
+Make sure the prediction and metrics files (`QB_Preds.parquet`, `RB_Metrics.parquet`, etc.) are saved in the app directory. You can regenerate them using the modeling scripts (`QB_Stat_Pred.qmd`, `RB_Stat_Pred.qmd`, `WR_TE_Stat_Pred.qmd`).
 
 ---
 
