@@ -223,10 +223,10 @@ server <- function(input, output) {
                            },
                            align = "left"
                          ),
-                         recent_team = colDef(name = "Tm", filterable = TRUE, minWidth = 65, align = "left"),
-                         opponent_team = colDef(name = "Opp", filterable = TRUE, minWidth = 65, align = "left"),
+                         recent_team = colDef(name = "Tm", filterable = TRUE, minWidth = 70, align = "left"),
+                         opponent_team = colDef(name = "Opp", filterable = TRUE, minWidth = 70, align = "left"),
                          game_date = colDef(name = "Game Date", filterable = TRUE, minWidth = 130, align = "center"),
-                         week = colDef(name = "Wk", filterable = TRUE, minWidth = 60, align = "center"),
+                         week = colDef(name = "Wk", filterable = TRUE, minWidth = 70, align = "center"),
                          pred_attempts = colDef(name = "Pass Att", filterable = TRUE, minWidth = 95, align = "right"),
                          pred_completions = colDef(name = "Cmp", filterable = TRUE, minWidth = 80, align = "right"),
                          pred_passing_yards = colDef(name = "Pass Yds", filterable = TRUE, minWidth = 100, align = "right"),
@@ -318,7 +318,6 @@ server <- function(input, output) {
           borderColor = "#FF0000"
         )
       ),
-      searchable = TRUE,
       striped = TRUE,
       highlight = TRUE,
       borderless = TRUE,
