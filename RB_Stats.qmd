@@ -1,0 +1,508 @@
+---
+title: "RB_Stat_Pred"
+author: "Jack Motta"
+format: 
+  html:
+    embed-resources: true
+editor: visual
+---
+
+## Load Libraries
+
+```{r}
+library(nflreadr)
+library(nflfastR)
+library(tidyverse)
+library(tidymodels)
+library(zoo)
+library(gt)
+library(doParallel)
+library(glmnet)
+library(factoextra)
+library(cluster)
+```
+
+## Data Acquisition
+
+### Running Backs
+
+```{r}
+options(nflreadr.verbose=FALSE) # Hide nflverse messages
+
+# Load base RB stats
+rb_stats <- load_player_stats(
+  2017:most_recent_season(F), stat_type = "offense") %>%
+  filter(position == "RB") %>%
+  rename(team = recent_team) %>%
+  rename(recent_team = team) %>%
+  select(-contains("passing"), -contains("pass"), -attempts, -completions,
+         -contains("sack"), -interceptions, -dakota, -pacr, -wopr, -special_teams_tds,
+         -contains("fumbles"))
+
+# Create game_info Contextual Data at the Game Level
+cl <- makeCluster(7)  
+registerDoParallel(cl)
+game_info <- load_pbp(2017:most_recent_season(F)) %>%
+  group_by(game_id, season, week) %>%
+  summarize(
+    # Use distinct game-level attributes
+    home_team = first(home_team),
+    away_team = first(away_team),
+    game_date = first(game_date),
+    .groups = "drop"
+  )
+stopCluster(cl)
+registerDoSEQ()
+
+# Duplicate rows to have game_id for each team
+game_info <- game_info %>%
+  select(game_id, game_date, season, week, home_team, away_team) %>%
+  mutate(recent_team = home_team) %>%
+  bind_rows(
+    game_info %>%
+      select(game_id, game_date, season, week, home_team, away_team) %>%
+      mutate(recent_team = away_team)
+  ) %>%
+  arrange(game_date, season, week, game_id)
+
+# Load NextGen Rush Stats
+nextgen_rush <- load_nextgen_stats(2017:most_recent_season(F), stat_type = "rushing") %>%
+  filter(player_position == "RB") %>%
+  filter(week != 0) %>%
+  select(-player_jersey_number, -player_gsis_id, -player_last_name, 
+         -player_first_name, -player_short_name, -player_position, 
+         -rush_attempts, -rush_yards, -rush_touchdowns, -contains("receiving"), 
+         -contains("expected")) %>%
+  rename(recent_team = team_abbr)
+
+# Pull Active RBs
+active_rbs <- load_rosters_weekly(2017:most_recent_season(F)) %>%
+  filter(position == "RB") %>%  # Filter for RBs
+  filter(season == most_recent_season(F), status == "ACT") %>% # Filter active QBs
+  pull(full_name)
+
+adv_rush <- load_pfr_advstats(2018:most_recent_season(F), stat_type = "rush", summary_level = "week") %>%
+  rename(player_display_name = pfr_player_name,
+         recent_team = team) %>%
+  select(-pfr_game_id, -game_type, -opponent, -carries, -pfr_player_id,
+         -contains("receiving"))
+
+adv_rec <- load_pfr_advstats(2018:most_recent_season(F), stat_type = "rec", summary_level = "week") %>%
+  select(-contains("rushing"), -contains("passing"), -pfr_player_id, -game_type,
+         -pfr_game_id) %>%
+  rename(player_display_name = pfr_player_name,
+         recent_team = team,
+         opponent_team = opponent) %>%
+  mutate(across(player_display_name, clean_player_names))
+
+# Join Base Stats with NextGen Stats and Game Info
+rb_stats <- rb_stats %>%
+  left_join(nextgen_rush, by = c("recent_team", "player_display_name", "season", 
+                                  "season_type", "week")) %>%
+  left_join(game_info, by = c("season", "week", "recent_team")) %>%
+  left_join(adv_rush, by = c("player_display_name", "recent_team", "season", "week", "game_id")) %>%
+  left_join(adv_rec, by = c("player_display_name", "recent_team", "season", "week", "game_id",
+                            "opponent_team")) %>%
+  filter(player_display_name %in% active_rbs)
+
+colSums(is.na(rb_stats)) # Check NAs
+
+# Create binary home/away flag
+rb_stats <- rb_stats %>%
+  # Create home/away indicator
+  mutate(
+    home_away = case_when(
+      recent_team == away_team ~ "Away",
+      recent_team == home_team ~ "Home",
+      TRUE ~ NA_character_
+    )) %>%
+  # Rearrange columns
+  select(-headshot_url, -position, -position_group, -player_name, -home_team, 
+         -away_team, -player_id) %>%
+  # Make rushing_epa NAs 0
+  mutate(rushing_epa = ifelse(is.na(rushing_epa), 0, rushing_epa),
+         across(player_display_name, clean_player_names)) %>%
+  select(player_display_name, recent_team, season, week, game_date, game_id,
+         opponent_team, season_type, home_away, everything())
+
+colSums(is.na(rb_stats)) # Check remaining NAs
+
+rm(active_rbs, nextgen_rush, adv_rush, adv_rec, game_info)
+gc()
+```
+
+### Opposing Defenses
+
+```{r}
+# Load weekly defensive player stats
+defense <- load_player_stats(2017:most_recent_season(F), "defense") %>%
+  select(-season_type, -player_id, -position_group, -position, -headshot_url, -player_name) %>%
+  rename(recent_team = team)
+
+adv_def <- load_pfr_advstats(2018:most_recent_season(F), stat_type = "def",
+                             summary_level = "week") %>%
+  select(-def_ints, -def_sacks, -pfr_game_id, -game_type,
+         -pfr_player_id, -opponent) %>%
+  rename(recent_team = team,
+         player_display_name = pfr_player_name) %>%
+  mutate(across(player_display_name, clean_player_names))
+  
+
+# Create opponent defense stats dataframe grouped by team, week, and season
+opponent_defense_stats <- rb_stats %>%
+  group_by(opponent_team, week, season) %>%
+  summarise(
+    def_fantasy_points_allowed = first(fantasy_points),
+    def_fantasy_points_ppr_allowed = first(fantasy_points_ppr),
+    def_carries_allowed = first(carries),
+    def_rushing_yards_allowed = first(rushing_yards), # Rushing yards allowed
+    def_rushing_tds_allowed = first(rushing_tds), # Rushing TDs allowed
+    def_rac_allowed = first(receiving_yards_after_catch),
+    def_receiving_tds_allowed = first(receiving_tds),
+    def_receiving_yards_allowed = first(receiving_yards),
+    def_receptions_allowed = first(receptions),
+    .groups = "drop"
+  )
+
+defense <- defense %>%
+  left_join(adv_def, by = c("recent_team", "week", "season", "player_display_name")) %>%
+  # Exclude specific columns from summation
+  select(-player_display_name) %>%
+  group_by(recent_team, season, week) %>%
+  summarise(
+    across(where(is.numeric), sum, .names = "{col}", na.rm = TRUE), 
+    .groups = "drop") %>%
+  arrange(season, week, recent_team) %>%
+  rename(opponent_team = recent_team) %>%
+  inner_join(opponent_defense_stats, by = c("opponent_team", "season", "week"))
+
+defense <- defense %>%
+  select(-contains('def_fumble'), -def_interception_yards,
+         -contains("sack"), -def_safety)
+
+colSums(is.na(defense))
+```
+
+### Merging
+
+```{r}
+gamelogs <- rb_stats %>%
+  left_join(defense, by = c("opponent_team", "week", "season"))
+arrow::write_parquet(gamelogs, "rb_gamelogs_pre.parquet")
+
+rm(rb_stats, defense, adv_def, opponent_defense_stats, cl)
+gc()
+```
+
+## Clustering
+
+```{r}
+gamelogs <- arrow::read_parquet("rb_gamelogs_pre.parquet")
+
+# Aggregate stats per player (mean per numeric column)
+player_summary <- gamelogs %>%
+  select(-recent_team, -season, -week, -game_id, -game_date, -opponent_team) %>%
+  group_by(player_display_name) %>%
+  summarise(across(where(is.numeric), mean, na.rm = TRUE)) %>%
+  ungroup() %>%
+  drop_na()
+  
+# Scale numeric features
+player_scaled <- scale(player_summary %>% select(-player_display_name))
+
+# PCA to reduce dimensionality for clustering
+res_pca <- PCA(player_scaled, scale.unit = TRUE, graph = F, ncp = 2)
+gamelogs_pca <- res_pca$ind$coord
+
+fviz_nbclust(gamelogs_pca, kmeans, method = "wss")
+fviz_nbclust(gamelogs_pca, kmeans, method = "silhouette")
+
+# Fit K-Means Clustering
+set.seed(6341)
+kmeans_fit <- kmeans(gamelogs_pca, centers = 2, nstart = 100)
+
+# Visualize Clusters with PCA
+fviz_cluster(kmeans_fit, data = gamelogs_pca, geom = "point", ellipse.type = "convex") +
+  ggtitle("K-Means Clustering of NFL RBs (k = 2)")
+
+# Add cluster assignments back to data
+player_clustered <- player_summary %>%
+  mutate(cluster = factor(kmeans_fit$cluster))
+
+player_clustered %>%
+  group_by(cluster) %>%
+  summarise(
+    across(where(is.numeric), mean, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+clusters <- player_clustered %>%
+  select(player_display_name, cluster)
+
+gamelogs <- gamelogs %>%
+  left_join(clusters, by = "player_display_name")
+
+rm(player_clustered, player_summary, player_scaled, kmeans_fit, res_pca,
+   clusters, gamelogs_pca)
+gc()
+```
+
+### Rolling Averages
+
+```{r}
+gamelogs <- gamelogs %>%
+  arrange(season, week) %>%  # Ensure correct order for rolling calculations
+  group_by(player_display_name) %>%
+  mutate(across(where(is.numeric) & !starts_with("def") & !all_of(c("season", "week")), 
+                ~ lag(rollapply(.x, width=4, 
+                  FUN=function(x) {
+                    alpha <- 2 / (length(x) + 1)  # Compute smoothing factor
+                    Reduce(function(prev, curr) alpha * curr + (1 - alpha) * prev, x, accumulate = TRUE)[length(x)]
+                    },
+                  fill=mean(.x, na.rm=TRUE), align="right", partial=TRUE), 1),  # Exclude current row using lag
+                .names = "roll_{.col}")) %>%
+  ungroup() %>%
+  group_by(opponent_team) %>%
+  mutate(across(starts_with("def_"), 
+                ~ lag(rollapply(.x, width=4, 
+                  FUN=function(x) {
+                    alpha <- 2 / (length(x) + 1)  # Compute smoothing factor
+                    Reduce(function(prev, curr) alpha * curr + (1 - alpha) * prev, x, accumulate = TRUE)[length(x)]
+                    },
+                  fill=mean(.x, na.rm=TRUE), align="right", partial=TRUE), 1),  # Exclude current row for defense stats too
+                .names = "roll_{.col}")) %>%
+  ungroup() %>%
+  select(player_display_name, recent_team, season, week, season_type, 
+         game_id, game_date, home_away, opponent_team, carries, rushing_yards, 
+         rushing_tds, receptions, receiving_yards, fantasy_points, 
+         fantasy_points_ppr, starts_with("roll_")) %>%
+  arrange(game_date, season, week, player_display_name) %>%
+  filter(season >= 2018) %>%
+  filter(carries > 0)
+
+sum(is.na(gamelogs)) # Total NAs in gamelogs
+head(gamelogs) # View first few rows of gamelogs
+```
+
+## Data Cleaning
+Most missing values are from rookies or players with limited games, so we will impute using lower quantile for a more conservative imputation.
+```{r}
+# Most NAs are for rookies/players w/ limited games so we will
+gamelogs <- gamelogs %>%
+  mutate(
+    across(
+      where(is.numeric),
+      ~ ifelse(is.na(.), quantile(., probs = 0.05, na.rm = TRUE), .)
+      )
+    )
+
+arrow::write_parquet(gamelogs, "rb_gamelogs_post.parquet")
+```
+
+
+## Modeling
+
+### Data Split
+
+```{r}
+set.seed(6341) # Set seed for reproducibility
+gamelogs <- arrow::read_parquet("rb_gamelogs_post.parquet") # Efficient Loading
+
+# Create a single split for the dataset
+player_splits <- make_splits(
+  gamelogs %>% filter(season < most_recent_season(F)),
+  gamelogs %>% filter(season >= most_recent_season(F))
+)
+
+# Extract training and testing datasets
+player_train <- training(player_splits)
+player_test <- testing(player_splits)
+
+rm(gamelogs)
+gc()
+```
+### Preprocessing Recipe
+
+```{r}
+id_vars <- c("player_display_name", "recent_team", "opponent_team", "season", "week", 
+             "game_id", "game_date")
+target_vars <- c("carries", "rushing_yards", "rushing_tds", "fantasy_points",
+                 "fantasy_points_ppr", "receptions", "receiving_yards")
+
+nfl_recipe <- recipe(~., data = player_train) %>%    
+  # Update roles
+  update_role(all_of(target_vars), new_role = "outcome") %>%
+  update_role(all_of(id_vars), new_role = "id") %>%
+  # Impute Missing Values
+  step_impute_mode(all_nominal_predictors()) %>%
+  step_impute_mean(all_numeric_predictors()) %>%
+  # Handle categorical data
+  step_novel(all_nominal_predictors()) %>%
+  step_unknown(all_nominal_predictors()) %>%
+  step_dummy(all_nominal_predictors(), -all_outcomes(), one_hot = FALSE) %>%
+  # Remove near-zero variance features
+  step_nzv(all_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+
+rec_prep <- prep(nfl_recipe)
+player_baked <- bake(rec_prep, new_data = NULL)
+```
+
+### Tuning Penalty Parameter
+```{r}
+set.seed(6341)
+# Assume player_baked is sorted by time
+x_mat <- model.matrix(~ ., player_baked %>% select(-all_of(c(target_vars, id_vars))))[, -1]
+y_mat <- as.matrix(player_baked %>% select(all_of(target_vars)))
+
+n <- nrow(x_mat)
+
+# Setup rolling origin resampling with exactly 10 folds
+num_folds <- 10
+assess_window <- floor(n * 0.1)
+skip <- floor((n - floor(n * 0.3) - assess_window) / num_folds)
+initial_window <- n - (num_folds * skip + assess_window)
+
+rolling_splits <- rolling_origin(
+  data.frame(idx = 1:n),
+  initial = initial_window,
+  assess = assess_window,
+  skip = skip,
+  cumulative = FALSE
+)
+
+lambda_grid <- 10^seq(2, -4, length.out = 500)
+lambda_rmse <- matrix(NA, nrow = length(lambda_grid), ncol = length(rolling_splits$splits))
+
+for (i in seq_along(rolling_splits$splits)) {
+  split <- rolling_splits$splits[[i]]
+  train_idx <- analysis(split)$idx
+  val_idx <- assessment(split)$idx
+
+  fit <- glmnet(
+    x = x_mat[train_idx, ],
+    y = y_mat[train_idx, ],
+    alpha = 1,
+    family = "mgaussian",
+    lambda = lambda_grid
+  )
+
+  preds <- predict(fit, newx = x_mat[val_idx, , drop = FALSE])
+
+  for (j in seq_along(lambda_grid)) {
+    pred_mat <- preds[, , j]
+    rmse_vals <- sqrt(colMeans((y_mat[val_idx, ] - pred_mat)^2))
+    lambda_rmse[j, i] <- mean(rmse_vals)
+  }
+}
+
+# Compute average RMSE across folds
+avg_rmse <- rowMeans(lambda_rmse, na.rm = TRUE)
+best_idx <- which.min(avg_rmse)
+best_lambda <- lambda_grid[best_idx]
+
+# Compute SE only at best lambda
+se_best <- sd(lambda_rmse[best_idx, ], na.rm = TRUE) / sqrt(sum(!is.na(lambda_rmse[best_idx, ])))
+lambda_1se <- max(lambda_grid[avg_rmse <= avg_rmse[best_idx] + se_best])
+```
+
+### Plot Tuning
+```{r, warning=FALSE, message=FALSE}
+# Plot RMSE vs. log(lambda)
+rmse_df <- data.frame(
+  log_lambda = log(lambda_grid),
+  avg_rmse = avg_rmse
+)
+
+best_label <- "Min RMSE Lambda"
+se_label <- "1SE Lambda"
+
+ggplot(rmse_df, aes(x = log_lambda, y = avg_rmse)) +
+  geom_line(size = 1) +
+  geom_point(size = 2) +
+  geom_vline(aes(xintercept = log(best_lambda), color = best_label), linetype = "dashed", linewidth = 1) +
+  geom_vline(aes(xintercept = log(lambda_1se), color = se_label), linetype = "dashed", linewidth = 1) +
+  scale_color_manual(
+    name = "Lambda Selection",
+    values = c("Min RMSE Lambda" = "red", "1SE Lambda" = "blue"),
+    labels = c("Min RMSE Lambda", "1SE Lambda")
+  ) +
+  scale_x_continuous(breaks = seq(floor(min(log(lambda_grid))), ceiling(max(log(lambda_grid))), by = 2)) +
+  labs(
+    title = "Rolling Origin CV: Lasso Lambda Tuning",
+    x = "log(Lambda)",
+    y = "Average RMSE"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    axis.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12)
+  )
+```
+
+### Refit Model
+```{r}
+set.seed(6341)
+final_fit <- glmnet(
+  x = x_mat,
+  y = y_mat,
+  alpha = 1,
+  family = "mgaussian",
+  lambda = best_lambda
+)  # ready for prediction
+
+saveRDS(final_fit, "RB_Pred_Model.rds")
+```
+
+### Evaluate on Test Set
+```{r}
+# Bake test set using same recipe
+player_test_baked <- bake(rec_prep, new_data = player_test)
+
+x_test_mat <- model.matrix(~ ., player_test_baked %>% select(-all_of(c(target_vars, id_vars))))[, -1]
+y_test <- as.matrix(player_test_baked %>% select(all_of(target_vars)))
+
+# Predict
+y_pred <- predict(final_fit, newx = x_test_mat)[, , 1]
+
+# Metric function
+get_metrics <- function(actual, predicted) {
+  rmse <- sqrt(mean((actual - predicted)^2))
+  rsq <- 1 - sum((actual - predicted)^2) / sum((actual - mean(actual))^2)
+  c(rmse = rmse, rsq = rsq)
+}
+
+# Metrics per response
+metrics_df <- purrr::map_dfr(
+  .x = colnames(y_test),
+  .f = ~ {
+    m <- get_metrics(y_test[, .x], y_pred[, .x])
+    tibble(response = .x, rmse = m["rmse"], rsq = m["rsq"])
+  }
+) %>%
+  mutate(across(where(is.numeric), round, 2))
+
+metrics_df
+arrow::write_parquet(metrics_df, "RB_Metrics.parquet")
+
+coef(final_fit)
+```
+
+## Create Final Prediction Dataframe
+```{r}
+# Make sure id_vars are still in the baked test set
+id_df <- player_test %>% select(all_of(id_vars), -game_id)
+
+# Convert predictions to tibble
+pred_df <- as_tibble(y_pred)
+colnames(pred_df) <- paste0("pred_", colnames(y_pred))
+
+# Combine original IDs + predictions
+pred_output <- bind_cols(id_df, pred_df)
+pred_output <- pred_output %>%
+  mutate(across(where(is.numeric), ~ round(.x, 1)))
+pred_output
+
+arrow::write_parquet(pred_output, "RB_Preds.parquet")
+```
