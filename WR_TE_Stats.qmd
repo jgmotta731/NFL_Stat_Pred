@@ -176,60 +176,7 @@ rm(rec_stats, defense, adv_def, opponent_defense_stats, cl)
 gc()
 ```
 
-## Clustering
-
-```{r}
-# Aggregate stats per player (mean per numeric column)
-player_summary <- gamelogs %>%
-  select(-recent_team, -season, -week, -game_id, -game_date, -opponent_team) %>%
-  group_by(player_display_name) %>%
-  summarise(across(where(is.numeric), mean, na.rm = TRUE)) %>%
-  ungroup() %>%
-  drop_na()
-  
-# Scale numeric features
-player_scaled <- scale(player_summary %>% select(-player_display_name))
-
-# PCA to reduce dimensionality for clustering
-res_pca <- PCA(player_scaled, scale.unit = TRUE, graph = F, ncp = 2)
-gamelogs_pca <- res_pca$ind$coord
-
-fviz_nbclust(gamelogs_pca, kmeans, method = "wss")
-fviz_nbclust(gamelogs_pca, kmeans, method = "silhouette")
-
-# Fit K-Means Clustering
-set.seed(6341)
-kmeans_fit <- kmeans(gamelogs_pca, centers = 2, nstart = 100)
-
-# Visualize Clusters with PCA
-fviz_cluster(kmeans_fit, data = gamelogs_pca, geom = "point", ellipse.type = "convex") +
-  ggtitle("K-Means Clustering of NFL Receivers (k = 2)")
-
-# Add cluster assignments back to data
-player_clustered <- player_summary %>%
-  mutate(cluster = factor(kmeans_fit$cluster))
-
-player_clustered %>%
-  group_by(cluster) %>%
-  summarise(
-    across(where(is.numeric), mean, na.rm = TRUE),
-    .groups = 'drop'
-  )
-
-clusters <- player_clustered %>%
-  select(player_display_name, cluster)
-
-gamelogs <- gamelogs %>%
-  left_join(clusters, by = "player_display_name")
-
-arrow::write_parquet(gamelogs, "rec_gamelogs_post.parquet")
-
-rm(player_clustered, player_summary, player_scaled, kmeans_fit, res_pca,
-   clusters, gamelogs_pca)
-gc()
-```
-
-### Rolling Averages
+## Rolling Averages
 
 ```{r}
 gamelogs <- arrow::read_parquet("rec_gamelogs_pre.parquet")
@@ -264,21 +211,6 @@ gamelogs <- gamelogs %>%
 
 sum(is.na(gamelogs)) # Total NAs in gamelogs
 head(gamelogs) # View first few rows of gamelogs
-```
-
-## Data Cleaning
-
-Most missing values are from rookies or players with limited games, so we will impute using lower quantile for a more conservative imputation.
-
-```{r}
-# Most NAs are for rookies/players w/ limited games so we will
-gamelogs <- gamelogs %>%
-  mutate(
-    across(
-      where(is.numeric),
-      ~ ifelse(is.na(.), quantile(., probs = 0.05, na.rm = TRUE), .)
-      )
-    )
 
 arrow::write_parquet(gamelogs, "rec_gamelogs_post.parquet")
 ```
@@ -289,7 +221,7 @@ arrow::write_parquet(gamelogs, "rec_gamelogs_post.parquet")
 
 ```{r}
 set.seed(6341) # Set seed for reproducibility
-gamelogs <- arrow::read_parquet("rec_gamelogs_post.parquet") # Efficient Loading
+gamelogs <- arrow::read_parquet("rec_gamelogs_post.parquet")
 
 # Create a single split for the dataset
 player_splits <- make_splits(

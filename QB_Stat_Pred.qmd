@@ -164,7 +164,9 @@ cat("Remaining NAs:", sum(is.na(qb_stats))) # Check remaining NAs
 rm(active_qbs, nextgen_pass, adv_pass, game_info, espn_qbr)
 gc()
 ```
+
 ### Opposing Defense
+
 ```{r, warning=FALSE, message=FALSE}
 # Load weekly defensive player stats
 defense <- load_player_stats(2015:most_recent_season(F), "defense") %>%
@@ -227,72 +229,11 @@ gc()
 arrow::write_parquet(gamelogs, "qb_gamelogs_pre.parquet")
 ```
 
-
-## Clustering
-```{r}
-gamelogs <- arrow::read_parquet("qb_gamelogs_pre.parquet") # Efficient Loading
-
-season_data <- load_pfr_advstats(2018:most_recent_season(F), stat_type = "pass", 
-                                 summary_level = "season") %>%
-  mutate(across(player, clean_player_names)) %>%
-  filter(player %in% gamelogs$player_display_name) %>%
-  arrange(player, season) %>%  # ensure time order
-  group_by(player) %>%
-  summarise(across(where(is.numeric), mean, na.rm = TRUE), .groups = "drop") %>%
-  mutate(across(where(is.numeric), ~ ifelse(is.nan(.), NA, .)))
-
-# Aggregate stats per player (mean per numeric column)
-player_summary <- gamelogs %>%
-  select(-recent_team, -season, -week, -game_id, -game_date, -opponent_team) %>%
-  group_by(player_display_name) %>%
-  summarise(across(where(is.numeric), mean, na.rm = TRUE), .groups = "drop") %>%
-  left_join(season_data, by = c("player_display_name"="player")) %>%
-  drop_na()
-
-# Scale numeric features
-player_scaled <- scale(player_summary %>% select(-player_display_name))
-
-# PCA to reduce dimensionality for clustering
-res_pca <- PCA(player_scaled, scale.unit = TRUE, graph = F, ncp = 2)
-gamelogs_pca <- res_pca$ind$coord
-
-fviz_nbclust(gamelogs_pca, kmeans, method = "wss")
-fviz_nbclust(gamelogs_pca, kmeans, method = "silhouette")
-
-# Fit K-Means Clustering
-set.seed(6341)
-kmeans_fit <- kmeans(gamelogs_pca, centers = 7, nstart = 100)
-
-# Visualize Clusters with PCA
-fviz_cluster(kmeans_fit, data = gamelogs_pca, geom = "point", ellipse.type = "convex") +
-  ggtitle("K-Means Clustering of NFL QBs (k = 7)")
-
-# Add cluster assignments back to data
-player_clustered <- player_summary %>%
-  mutate(cluster = factor(kmeans_fit$cluster))
-
-player_clustered %>%
-  group_by(cluster) %>%
-  summarise(
-    across(where(is.numeric), mean, na.rm = TRUE),
-    .groups = 'drop'
-  )
-
-clusters <- player_clustered %>%
-  select(player_display_name, cluster)
-
-gamelogs <- gamelogs %>%
-  left_join(clusters, by = "player_display_name")
-
-#| output: false
-rm(player_clustered, player_summary, player_scaled, kmeans_fit, res_pca,
-   clusters, gamelogs_pca, season_data)
-gc()
-```
-
 ### Rolling Averages
 
 ```{r, warning=FALSE, message=FALSE}
+gamelogs <- arrow::read_parquet("qb_gamelogs_pre.parquet")
+
 gamelogs <- gamelogs %>%
   arrange(season, week) %>%  # Ensure correct order for rolling calculations
   group_by(player_display_name) %>%
@@ -318,7 +259,7 @@ gamelogs <- gamelogs %>%
   select(player_display_name, recent_team, season, week, season_type, 
          game_id, game_date, home_away, opponent_team, attempts, completions,
          passing_yards, passing_tds, interceptions, carries, rushing_yards, rushing_tds, 
-         fantasy_points, starts_with("roll_"), cluster) %>%
+         fantasy_points, starts_with("roll_")) %>%
   arrange(game_date, season, week, player_display_name) %>%
   filter(season >= 2018) %>%
   filter(attempts >= 15)
@@ -329,28 +270,13 @@ head(gamelogs) # View first few rows of gamelogs
 
 arrow::write_parquet(gamelogs, "qb_gamelogs_post.parquet")
 ```
-## Data Cleaning
-Most missing values are from rookies or players with limited games, so we will impute using lower quantile for a more conservative imputation.
-```{r}
-# Most NAs are for rookies/players w/ limited games so we will
-gamelogs <- gamelogs %>%
-  mutate(
-    across(
-      where(is.numeric),
-      ~ ifelse(is.na(.), quantile(., probs = 0.05, na.rm = TRUE), .)
-      )
-    )
-
-arrow::write_parquet(gamelogs, "qb_gamelogs_post.parquet")
-```
-
 ## Modeling
 
 ### Data Split
 
 ```{r, warning=FALSE, message=FALSE}
 set.seed(6341) # Set seed for reproducibility
-gamelogs <- arrow::read_parquet("qb_gamelogs_post.parquet") # Efficient Loading
+gamelogs <- arrow::read_parquet("qb_gamelogs_post.parquet")
 
 # Create a single split for the dataset
 player_splits <- make_splits(
@@ -361,21 +287,17 @@ player_splits <- make_splits(
 # Extract training and testing datasets
 player_train <- training(player_splits)
 player_test <- testing(player_splits)
-
-#| output: false
-rm(gamelogs)
-gc()
 ```
 
 ### Preprocessing Recipe
 
 ```{r}
-target_vars <- c(
-  "attempts", "completions", "passing_yards", "passing_tds", "interceptions",
-  "carries", "rushing_yards", "rushing_tds", "fantasy_points")
-
 id_vars <- c("player_display_name", "recent_team", "season", "week", 
              "game_id", "game_date", "opponent_team")
+
+target_vars <- c("attempts", "completions", "passing_yards", "passing_tds", 
+                 "interceptions","carries", "rushing_yards", "rushing_tds", 
+                 "fantasy_points")
 
 nfl_recipe <- recipe(~., data = player_train) %>%    
   # Update roles
@@ -394,9 +316,14 @@ nfl_recipe <- recipe(~., data = player_train) %>%
 
 rec_prep <- prep(nfl_recipe)
 player_baked <- bake(rec_prep, new_data = NULL)
+
+#| output: false
+rm(gamelogs)
+gc()
 ```
 
 ### Hyperparameter Tuning
+
 ```{r}
 set.seed(6341)
 # Assume player_baked is sorted by time
@@ -419,7 +346,7 @@ rolling_splits <- rolling_origin(
   cumulative = FALSE
 )
 
-lambda_grid <- 10^seq(2, -4, length.out = 500)
+lambda_grid <- 10^seq(0.1, -5, length.out = 500)
 lambda_rmse <- matrix(NA, nrow = length(lambda_grid), ncol = length(rolling_splits$splits))
 
 for (i in seq_along(rolling_splits$splits)) {
@@ -455,7 +382,8 @@ lambda_1se <- max(lambda_grid[avg_rmse <= avg_rmse[best_idx] + se_best])
 ```
 
 #### Plot Manual Tuning
-```{r}
+
+```{r, warning=FALSE}
 # Plot RMSE vs. log(lambda)
 rmse_df <- data.frame(
   log_lambda = log(lambda_grid),
@@ -490,6 +418,7 @@ ggplot(rmse_df, aes(x = log_lambda, y = avg_rmse)) +
 ```
 
 ### Refit Model with Best Lambda
+
 ```{r}
 set.seed(6341)
 final_fit <- glmnet(
@@ -504,6 +433,7 @@ saveRDS(final_fit, "QB_Pred_Model.rds")
 ```
 
 ### Evaluate on Test Set
+
 ```{r}
 # Bake test set using same recipe
 player_test_baked <- bake(rec_prep, new_data = player_test)
@@ -537,6 +467,7 @@ coef(final_fit)
 ```
 
 ## Extract Predictions
+
 ```{r}
 # Make sure id_vars are still in the baked test set
 id_df <- player_test %>% select(all_of(id_vars))
@@ -553,4 +484,3 @@ pred_output
 
 arrow::write_parquet(pred_output, "QB_Preds.parquet")
 ```
-

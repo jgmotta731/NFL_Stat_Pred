@@ -194,62 +194,11 @@ rm(rb_stats, defense, adv_def, opponent_defense_stats, cl)
 gc()
 ```
 
-## Clustering
+### Rolling Averages
 
 ```{r}
 gamelogs <- arrow::read_parquet("rb_gamelogs_pre.parquet")
 
-# Aggregate stats per player (mean per numeric column)
-player_summary <- gamelogs %>%
-  select(-recent_team, -season, -week, -game_id, -game_date, -opponent_team) %>%
-  group_by(player_display_name) %>%
-  summarise(across(where(is.numeric), mean, na.rm = TRUE)) %>%
-  ungroup() %>%
-  drop_na()
-  
-# Scale numeric features
-player_scaled <- scale(player_summary %>% select(-player_display_name))
-
-# PCA to reduce dimensionality for clustering
-res_pca <- PCA(player_scaled, scale.unit = TRUE, graph = F, ncp = 2)
-gamelogs_pca <- res_pca$ind$coord
-
-fviz_nbclust(gamelogs_pca, kmeans, method = "wss")
-fviz_nbclust(gamelogs_pca, kmeans, method = "silhouette")
-
-# Fit K-Means Clustering
-set.seed(6341)
-kmeans_fit <- kmeans(gamelogs_pca, centers = 2, nstart = 100)
-
-# Visualize Clusters with PCA
-fviz_cluster(kmeans_fit, data = gamelogs_pca, geom = "point", ellipse.type = "convex") +
-  ggtitle("K-Means Clustering of NFL RBs (k = 2)")
-
-# Add cluster assignments back to data
-player_clustered <- player_summary %>%
-  mutate(cluster = factor(kmeans_fit$cluster))
-
-player_clustered %>%
-  group_by(cluster) %>%
-  summarise(
-    across(where(is.numeric), mean, na.rm = TRUE),
-    .groups = 'drop'
-  )
-
-clusters <- player_clustered %>%
-  select(player_display_name, cluster)
-
-gamelogs <- gamelogs %>%
-  left_join(clusters, by = "player_display_name")
-
-rm(player_clustered, player_summary, player_scaled, kmeans_fit, res_pca,
-   clusters, gamelogs_pca)
-gc()
-```
-
-### Rolling Averages
-
-```{r}
 gamelogs <- gamelogs %>%
   arrange(season, week) %>%  # Ensure correct order for rolling calculations
   group_by(player_display_name) %>%
@@ -282,23 +231,9 @@ gamelogs <- gamelogs %>%
 
 sum(is.na(gamelogs)) # Total NAs in gamelogs
 head(gamelogs) # View first few rows of gamelogs
-```
-
-## Data Cleaning
-Most missing values are from rookies or players with limited games, so we will impute using lower quantile for a more conservative imputation.
-```{r}
-# Most NAs are for rookies/players w/ limited games so we will
-gamelogs <- gamelogs %>%
-  mutate(
-    across(
-      where(is.numeric),
-      ~ ifelse(is.na(.), quantile(., probs = 0.05, na.rm = TRUE), .)
-      )
-    )
 
 arrow::write_parquet(gamelogs, "rb_gamelogs_post.parquet")
 ```
-
 
 ## Modeling
 
@@ -321,11 +256,12 @@ player_test <- testing(player_splits)
 rm(gamelogs)
 gc()
 ```
+
 ### Preprocessing Recipe
 
 ```{r}
-id_vars <- c("player_display_name", "recent_team", "opponent_team", "season", "week", 
-             "game_id", "game_date")
+id_vars <- c("player_display_name", "recent_team", "opponent_team", "season", "week", "game_id", "game_date")
+
 target_vars <- c("carries", "rushing_yards", "rushing_tds", "fantasy_points",
                  "fantasy_points_ppr", "receptions", "receiving_yards")
 
@@ -349,6 +285,7 @@ player_baked <- bake(rec_prep, new_data = NULL)
 ```
 
 ### Tuning Penalty Parameter
+
 ```{r}
 set.seed(6341)
 # Assume player_baked is sorted by time
@@ -407,6 +344,7 @@ lambda_1se <- max(lambda_grid[avg_rmse <= avg_rmse[best_idx] + se_best])
 ```
 
 ### Plot Tuning
+
 ```{r, warning=FALSE, message=FALSE}
 # Plot RMSE vs. log(lambda)
 rmse_df <- data.frame(
@@ -442,6 +380,7 @@ ggplot(rmse_df, aes(x = log_lambda, y = avg_rmse)) +
 ```
 
 ### Refit Model
+
 ```{r}
 set.seed(6341)
 final_fit <- glmnet(
@@ -456,6 +395,7 @@ saveRDS(final_fit, "RB_Pred_Model.rds")
 ```
 
 ### Evaluate on Test Set
+
 ```{r}
 # Bake test set using same recipe
 player_test_baked <- bake(rec_prep, new_data = player_test)
@@ -490,6 +430,7 @@ coef(final_fit)
 ```
 
 ## Create Final Prediction Dataframe
+
 ```{r}
 # Make sure id_vars are still in the baked test set
 id_df <- player_test %>% select(all_of(id_vars), -game_id)
