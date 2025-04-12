@@ -32,6 +32,8 @@ This project demonstrates full-stack R development — from data ingestion and m
   - NextGen Stats
   - Pro Football Reference (advanced stats)
 
+**Note: The link to the Shiny app can be found at the bottom of this file.**
+
 ---
 
 ## 📊 Model Metrics
@@ -111,6 +113,9 @@ This project simulates a real-world workflow in data science and applied modelin
 This project serves as both a practical tool and a demonstration of applied modeling, reproducibility, and front-end integration in R.
 
 ---
+
+## Shiny App Link
+[https://jmotta31.shinyapps.io/NFL_Performance_Final/](https://jmotta31.shinyapps.io/NFL_Performance_Final/)
 
 ## 📬 Contact
 
