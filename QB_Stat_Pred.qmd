@@ -1,9 +1,11 @@
 ---
-title: "QB Stat Prediction"
+title: "QB Stat Predictions"
 author: "Jack Motta"
 format: 
   html:
     embed-resources: true
+execute: 
+  warning: false
 editor: visual
 ---
 
@@ -18,6 +20,9 @@ library(doParallel)
 library(glmnet)
 library(factoextra)
 library(cluster)
+library(purrr)
+library(tibble)
+library(foreach)
 ```
 
 # Quarterbacks
@@ -270,13 +275,313 @@ head(gamelogs) # View first few rows of gamelogs
 
 arrow::write_parquet(gamelogs, "qb_gamelogs_post.parquet")
 ```
-## Modeling
+
+## Modeling - Classification
+```{r}
+set.seed(6341) # Set seed for reproducibility
+
+gamelogs <- arrow::read_parquet("qb_gamelogs_post.parquet") %>%
+  mutate(
+    attempts_bin       = cut(attempts, breaks = c(-Inf, 20, 30, 40, Inf), labels = 0:3, right = FALSE),
+    completions_bin    = cut(completions, breaks = c(-Inf, 15, 25, 30, Inf), labels = 0:3, right = FALSE),
+    passing_yards_bin  = cut(passing_yards, breaks = c(-Inf, 100, 200, 300, Inf), labels = 0:3, right = FALSE),
+    passing_tds_bin    = cut(passing_tds, breaks = c(-Inf, 1, 2, 3, Inf), labels = 0:3, right = FALSE),
+    interceptions_bin  = cut(interceptions, breaks = c(-Inf, 0, 1, 2, Inf), labels = 0:3, right = FALSE),
+    carries_bin        = cut(carries, breaks = c(-Inf, 2, 5, 10, Inf), labels = 0:3, right = FALSE),
+    rushing_yards_bin  = cut(rushing_yards, breaks = c(-Inf, 10, 25, 50, Inf), labels = 0:3, right = FALSE),
+    rushing_tds_bin    = cut(rushing_tds, breaks = c(0, 1, 2, Inf), labels = 0:2, right = FALSE),
+    fantasy_points_bin = cut(fantasy_points, breaks = c(-Inf, 10, 20, 30, Inf), labels = 0:3, right = FALSE)
+  ) %>%
+  mutate(across(ends_with("_bin"), ~ as.integer(as.character(.))))
+
+# Create a single split for the dataset
+player_splits <- make_splits(
+  gamelogs %>% filter(season < most_recent_season(F)),
+  gamelogs %>% filter(season >= most_recent_season(F))
+)
+
+# Extract training and testing datasets
+player_train <- training(player_splits)
+player_test <- testing(player_splits)
+```
+
+### Preprocessing Recipe
+```{r}
+id_vars <- c("player_display_name", "recent_team", "season", "week", 
+             "game_id", "game_date", "opponent_team")
+
+reg_target_vars <- c("attempts", "completions", "passing_yards", "passing_tds", 
+                 "interceptions","carries", "rushing_yards", "rushing_tds", 
+                 "fantasy_points")
+
+target_class_vars <- c("attempts_bin", "completions_bin", "passing_yards_bin", "passing_tds_bin", 
+                 "interceptions_bin","carries_bin", "rushing_yards_bin", "rushing_tds_bin", 
+                 "fantasy_points_bin")
+
+nfl_recipe <- recipe(~., data = player_train) %>%    
+  # Update roles
+  step_rm(all_of(reg_target_vars)) %>%
+  update_role(all_of(target_class_vars), new_role = "outcome") %>%
+  update_role(all_of(id_vars), new_role = "id") %>%
+  # Impute Missing Values
+  step_impute_mode(all_nominal_predictors()) %>%
+  step_impute_mean(all_numeric_predictors()) %>%
+  # Handle categorical data
+  step_novel(all_nominal_predictors()) %>%
+  step_unknown(all_nominal_predictors()) %>%
+  step_dummy(all_nominal_predictors(), -all_outcomes(), one_hot = TRUE) %>%
+  # Remove near-zero variance features
+  step_nzv(all_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+
+rec_prep <- prep(nfl_recipe)
+player_baked <- bake(rec_prep, new_data = NULL)
+
+#| output: false
+rm(gamelogs)
+gc()
+```
+### Training
+```{r}
+# Assume player_baked is already sorted by time
+x_mat <- model.matrix(~ ., player_baked %>% select(-all_of(c(target_class_vars, id_vars))))[, -1]
+n <- nrow(x_mat)
+
+num_folds <- 10
+assess_window <- floor(n * 0.1)
+skip <- floor((n - floor(n * 0.3) - assess_window) / num_folds)
+initial_window <- n - (num_folds * skip + assess_window)
+
+rolling_splits <- rolling_origin(
+  data.frame(idx = 1:n),
+  initial = initial_window,
+  assess = assess_window,
+  skip = skip,
+  cumulative = FALSE
+)
+
+lambda_grid <- 10^seq(0.1, -5, length.out = 500)
+min_class_size <- 8
+
+# Store best lambdas and final models
+best_lambdas <- list()
+all_models <- list()
+
+for (target in target_class_vars) {
+  y <- player_baked[[target]]
+  n <- nrow(x_mat)
+
+  # Define rolling origin splits
+  assess_window <- floor(n * 0.1)
+  num_folds <- 10
+  skip <- floor((n - floor(n * 0.3) - assess_window) / num_folds)
+  initial_window <- n - (num_folds * skip + assess_window)
+
+  rolling_splits <- rsample::rolling_origin(
+    data.frame(idx = 1:n),
+    initial = initial_window,
+    assess = assess_window,
+    skip = skip,
+    cumulative = FALSE
+  )
+
+  lambda_logloss <- matrix(NA, nrow = length(lambda_grid), ncol = length(rolling_splits$splits))
+
+  for (i in seq_along(rolling_splits$splits)) {
+    split <- rolling_splits$splits[[i]]
+    train_idx <- rsample::analysis(split)$idx
+    val_idx <- rsample::assessment(split)$idx
+
+    train_y <- y[train_idx]
+    class_counts <- table(train_y)
+
+    # Skip fold if any class has < min_class_size
+    if (any(class_counts < min_class_size)) {
+      warning(paste("Skipping fold", i, "for", target, "- sparse class found"))
+      next
+    }
+
+    fit <- glmnet::glmnet(
+      x = x_mat[train_idx, ],
+      y = train_y,
+      alpha = 1,
+      family = "multinomial",
+      lambda = lambda_grid
+    )
+
+    preds <- predict(fit, newx = x_mat[val_idx, , drop = FALSE], type = "response")
+
+    for (j in seq_along(lambda_grid)) {
+      prob_mat <- preds[, , j]
+      true <- factor(y[val_idx])
+      pred_probs <- prob_mat[cbind(1:nrow(prob_mat), as.numeric(true))]
+      log_loss <- -mean(log(pmax(pred_probs, 1e-15)))  # avoid log(0)
+      lambda_logloss[j, i] <- log_loss
+    }
+  }
+
+  avg_logloss <- rowMeans(lambda_logloss, na.rm = TRUE)
+
+  if (all(is.na(avg_logloss))) {
+    warning(paste("No valid folds found for", target, "- skipping model"))
+    next
+  }
+
+  best_idx <- which.min(avg_logloss)
+  best_lambda <- lambda_grid[best_idx]
+
+  best_lambdas[[target]] <- best_lambda
+
+  # Refit final model using best lambda
+  final_model <- glmnet::glmnet(
+    x = x_mat,
+    y = y,
+    alpha = 1,
+    family = "multinomial",
+    lambda = best_lambda
+  )
+
+  all_models[[target]] <- final_model
+}
+
+saveRDS(final_model, "prob_model.rds")
+```
+### Model Evaluation
+```{r, warning=FALSE, message=FALSE}
+# Predict on test set
+player_test_baked <- bake(rec_prep, new_data = player_test)
+
+x_test_mat <- model.matrix(~ ., player_test_baked %>% select(-all_of(c(target_class_vars, id_vars))))[, -1]
+y_test <- player_test_baked %>% select(all_of(target_class_vars)) %>% as.data.frame()
+
+# Get predictions for each target
+y_pred <- map_dfc(
+  .x = target_class_vars,
+  .f = ~ {
+    pred <- predict(all_models[[.x]], newx = x_test_mat, type = "class")[, 1]
+    tibble(!!paste0(.x) := as.integer(pred))
+  }
+)
+
+# Metric function (classification version)
+get_metrics <- function(actual, predicted) {
+  levels_union <- sort(unique(c(actual, predicted)))
+  actual <- factor(actual, levels = levels_union)
+  predicted <- factor(predicted, levels = levels_union)
+  acc <- mean(predicted == actual)
+  f1_weighted <- suppressWarnings(
+    yardstick::f_meas_vec(actual, predicted, estimator = "macro_weighted")
+  )
+  precision_weighted <- suppressWarnings(
+    yardstick::precision_vec(actual, predicted, estimator = "macro_weighted")
+  )
+  recall_weighted <- suppressWarnings(
+    yardstick::recall_vec(actual, predicted, estimator = "macro_weighted")
+  )
+  c(accuracy = acc,
+    f1_weighted = f1_weighted,
+    precision_weighted = precision_weighted,
+    recall_weighted = recall_weighted)
+}
+# Metrics per response
+metrics_df <- purrr::map_dfr(
+  .x = target_class_vars,
+  .f = ~ {
+    m <- get_metrics(y_test[[.x]], y_pred[[.x]])
+    tibble(
+      response = .x,
+      accuracy = m["accuracy"],
+      f1_weighted = m["f1_weighted"],
+      precision_weighted = m["precision_weighted"],
+      recall_weighted = m["recall_weighted"]
+    )
+  }
+) %>%
+  mutate(across(where(is.numeric), round, 3))
+
+metrics_df
+arrow::write_parquet(metrics_df, "prob_metrics.parquet")
+```
+### Add Class Probabilities
+```{r}
+bin_breaks_list <- list(
+  attempts_bin       = c(-Inf, 20, 30, 40, Inf),
+  completions_bin    = c(-Inf, 15, 20, 30, Inf),
+  passing_yards_bin  = c(-Inf, 100, 200, 300, Inf),
+  passing_tds_bin    = c(-Inf, 1, 2, 3, Inf),
+  interceptions_bin  = c(-Inf, 0, 1, 2, Inf),
+  carries_bin        = c(-Inf, 2, 5, 10, Inf),
+  rushing_yards_bin  = c(-Inf, 10, 25, 50, Inf),
+  rushing_tds_bin    = c(0, 1, 2, Inf),
+  fantasy_points_bin = c(-Inf, 10, 20, 30, Inf)
+)
+
+format_range <- function(lower, upper) {
+  if (is.infinite(upper)) {
+    return(paste0(lower, "_plus"))
+  } else if (is.infinite(lower)) {
+    return(paste0("0_", upper))
+  } else {
+    return(paste0(lower, "_", upper))
+  }
+}
+
+get_class_probs <- function(model, newx, target_name, breaks) {
+  probs <- predict(model, newx = newx, type = "response")[, , 1]
+  probs_df <- as.data.frame(probs)
+  # Use class labels learned by glmnet
+  model_labels <- model$classnames
+  # Generate human-readable bin ranges just for those learned
+  labels <- purrr::map_chr(seq_along(model_labels), function(i) {
+    bin_index <- as.integer(model_labels[i]) + 1  # +1 to index into breaks
+    format_range(breaks[bin_index], breaks[bin_index + 1])
+  })
+  colnames(probs_df) <- paste0(target_name, "_", labels, "_prob")
+  return(probs_df)
+}
+
+# TRAINING PROBABILITIES
+train_prob_feats <- purrr::map2_dfc(
+  .x = target_class_vars,
+  .y = bin_breaks_list[target_class_vars],
+  ~ get_class_probs(
+      model = all_models[[.x]],
+      newx = x_mat,
+      target_name = .x,
+      breaks = .y
+    )
+)
+
+# TESTING PROBABILITIES
+test_prob_feats <- purrr::map2_dfc(
+  .x = target_class_vars,
+  .y = bin_breaks_list[target_class_vars],
+  ~ get_class_probs(
+      model = all_models[[.x]],
+      newx = x_test_mat,
+      target_name = .x,
+      breaks = .y
+    )
+)
+
+names(train_prob_feats)
+combined_prob_feats <- bind_rows(train_prob_feats, test_prob_feats)
+
+gamelogs <- arrow::read_parquet("qb_gamelogs_post.parquet")
+gamelogs <- bind_cols(gamelogs, combined_prob_feats)
+arrow::write_parquet(gamelogs, "qb_gamelogs_post_class.parquet")
+
+rm(gamelogs, fit, final_model, all_models, lambda_grid, metrics_df, bin_breaks_list, train_prob_feats, test_prob_feats, x_test_mat, y_test, y_pred, prob_mat, x_mat, best_idx, best_lambda, best_lambdas, min_class_size, pred_probs, preds, train_y, train_idx, var, y, true, target_class_vars, skip, j, log_loss, i, class_counts, bin_vars, avg_logloss, assess_window, lambda_logloss, combined_prob_feats)
+gc()
+```
+
+## Modeling - Regression
 
 ### Data Split
 
 ```{r, warning=FALSE, message=FALSE}
 set.seed(6341) # Set seed for reproducibility
-gamelogs <- arrow::read_parquet("qb_gamelogs_post.parquet")
+gamelogs <- arrow::read_parquet("qb_gamelogs_post_class.parquet")
 
 # Create a single split for the dataset
 player_splits <- make_splits(
@@ -317,7 +622,6 @@ nfl_recipe <- recipe(~., data = player_train) %>%
 rec_prep <- prep(nfl_recipe)
 player_baked <- bake(rec_prep, new_data = NULL)
 
-#| output: false
 rm(gamelogs)
 gc()
 ```
@@ -346,14 +650,27 @@ rolling_splits <- rolling_origin(
   cumulative = FALSE
 )
 
-lambda_grid <- 10^seq(0.1, -5, length.out = 500)
+lambda_grid <- 10^seq(0.1, -5, length.out = 100)
 lambda_rmse <- matrix(NA, nrow = length(lambda_grid), ncol = length(rolling_splits$splits))
 
-for (i in seq_along(rolling_splits$splits)) {
+# Register 10 cores
+cl <- makeCluster(10)
+registerDoParallel(cl)
+
+# Preallocate result matrix
+lambda_rmse <- matrix(NA, nrow = length(lambda_grid), ncol = length(rolling_splits$splits))
+
+# Parallel loop
+results <- foreach(i = seq_along(rolling_splits$splits),
+                   .packages = c("glmnet", "rsample")) %dopar% {
   split <- rolling_splits$splits[[i]]
   train_idx <- analysis(split)$idx
   val_idx <- assessment(split)$idx
-
+  
+  if (length(train_idx) == 0 || length(val_idx) == 0) {
+    return(rep(NA, length(lambda_grid)))
+  }
+  
   fit <- glmnet(
     x = x_mat[train_idx, ],
     y = y_mat[train_idx, ],
@@ -361,15 +678,24 @@ for (i in seq_along(rolling_splits$splits)) {
     family = "mgaussian",
     lambda = lambda_grid
   )
-
+  
   preds <- predict(fit, newx = x_mat[val_idx, , drop = FALSE])
-
+  
+  rmse_fold <- numeric(length(lambda_grid))
   for (j in seq_along(lambda_grid)) {
     pred_mat <- preds[, , j]
     rmse_vals <- sqrt(colMeans((y_mat[val_idx, ] - pred_mat)^2))
-    lambda_rmse[j, i] <- mean(rmse_vals)
+    rmse_fold[j] <- mean(rmse_vals)
   }
+  return(rmse_fold)
 }
+
+# Convert list of results to matrix
+lambda_rmse <- do.call(cbind, results)
+
+# Stop cluster
+stopCluster(cl)
+registerDoSEQ()
 
 # Compute average RMSE across folds
 avg_rmse <- rowMeans(lambda_rmse, na.rm = TRUE)
@@ -381,40 +707,14 @@ se_best <- sd(lambda_rmse[best_idx, ], na.rm = TRUE) / sqrt(sum(!is.na(lambda_rm
 lambda_1se <- max(lambda_grid[avg_rmse <= avg_rmse[best_idx] + se_best])
 ```
 
-#### Plot Manual Tuning
+#### Plot Tuning
 
 ```{r, warning=FALSE}
-# Plot RMSE vs. log(lambda)
-rmse_df <- data.frame(
-  log_lambda = log(lambda_grid),
-  avg_rmse = avg_rmse
-)
-
-best_label <- "Min RMSE Lambda"
-se_label <- "1SE Lambda"
-
-ggplot(rmse_df, aes(x = log_lambda, y = avg_rmse)) +
-  geom_line(size = 1) +
-  geom_point(size = 2) +
-  geom_vline(aes(xintercept = log(best_lambda), color = best_label), linetype = "dashed", linewidth = 1) +
-  geom_vline(aes(xintercept = log(lambda_1se), color = se_label), linetype = "dashed", linewidth = 1) +
-  scale_color_manual(
-    name = "Lambda Selection",
-    values = c("Min RMSE Lambda" = "red", "1SE Lambda" = "blue"),
-    labels = c("Min RMSE Lambda", "1SE Lambda")
-  ) +
-  scale_x_continuous(breaks = seq(floor(min(log(lambda_grid))), ceiling(max(log(lambda_grid))), by = 2)) +
-  labs(
-    title = "Rolling Origin CV: Lasso Lambda Tuning",
-    x = "log(Lambda)",
-    y = "Average RMSE"
-  ) +
-  theme_minimal() +
-  theme(
-    legend.position = "bottom",
-    axis.text.x = element_text(size = 12),
-    axis.text.y = element_text(size = 12)
-  )
+plot(log10(lambda_grid), avg_rmse, type = "l", col = "blue", lwd = 2,
+     xlab = "log10(lambda)", ylab = "Avg RMSE", main = "Lambda Tuning Curve")
+abline(v = log10(best_lambda), col = "red", lty = 2)
+abline(v = log10(lambda_1se), col = "green", lty = 2)
+legend("topright", legend = c("Best", "1SE"), col = c("red", "green"), lty = 2)
 ```
 
 ### Refit Model with Best Lambda
