@@ -10,15 +10,22 @@ library(nflreadr)
 
 # Load headshots
 headshots <- load_player_stats(2018:most_recent_season()) %>%
-  filter(position %in% c("WR", "TE", "QB", "RB")) %>%
   select(player_display_name, headshot_url) %>%
-  mutate(player_display_name = player_display_name) %>%
+  mutate(across(player_display_name, clean_player_names)) %>%
   distinct(player_display_name, .keep_all = TRUE)
 
 # Load prediction data
-qb_preds <- read_parquet("QB_Preds.parquet") %>% left_join(headshots, by = "player_display_name")
-rb_preds <- read_parquet("RB_Preds.parquet") %>% left_join(headshots, by = "player_display_name")
-rec_preds <- read_parquet("WR_TE_Preds.parquet") %>% left_join(headshots, by = "player_display_name")
+qb_preds <- read_parquet("QB_Preds.parquet") %>% 
+  left_join(headshots, by = "player_display_name") %>% 
+  filter(season == get_current_season(F) & week == get_current_week(F))
+
+rb_preds <- read_parquet("RB_Preds.parquet") %>% 
+  left_join(headshots, by = "player_display_name") %>%
+  filter(season == get_current_season(F) & week == get_current_week(F))
+
+rec_preds <- read_parquet("WR_TE_Preds.parquet") %>% 
+  left_join(headshots, by = "player_display_name") %>%
+  filter(season == get_current_season(F) & week == get_current_week(F))
 
 # Load metrics data
 qb_metrics <- read_parquet("QB_Metrics.parquet")
@@ -120,8 +127,11 @@ ui <- tagList(
                 p(HTML("Enter American odds (positive or negative) to calculate the implied probability of the event.")),
                 textInput("american_odds", "American Odds:", ""),
                 actionButton("calculate", "Calculate", style = "background-color: #FF0000; color: #FFFFFF;"),
-                verbatimTextOutput("implied_prob")
-              )
+                div(
+                  style = "font-size: 13px; margin-top: 10px;",
+                  verbatimTextOutput("implied_prob")
+                )              
+                )
             ),
             column(
               width = 10,
@@ -186,7 +196,6 @@ ui <- tagList(
   )
 )
 
-# Server
 # Server
 server <- function(input, output) {
   
@@ -331,7 +340,7 @@ server <- function(input, output) {
     req(input$calculate)
     odds <- as.numeric(input$american_odds)
     if (is.na(odds)) {
-      return("Please enter a valid numeric American Odds.")
+      return("Please enter American Odds.")
     }
     prob <- if (odds < 0) {
       abs(odds) / (abs(odds) + 100) * 100
