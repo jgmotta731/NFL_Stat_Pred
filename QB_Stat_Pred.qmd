@@ -23,6 +23,7 @@ library(cluster)
 library(purrr)
 library(tibble)
 library(foreach)
+library(TTR)
 ```
 
 # Quarterbacks
@@ -137,8 +138,8 @@ qb_stats <- qb_stats %>%
                              "recent_team"="team_abb", 
                              "player_display_name"="name_display")) %>%
   left_join(adv_pass, by = c("game_id", "player_display_name", "opponent_team",
-                             "recent_team", "season", "week")) %>%
-  filter(player_display_name %in% active_qbs)
+                             "recent_team", "season", "week"))
+  #filter(player_display_name %in% active_qbs)
 
 cat("Number of NAs:", sum(is.na(qb_stats))) # Check NAs
 
@@ -239,44 +240,75 @@ arrow::write_parquet(gamelogs, "qb_gamelogs_pre.parquet")
 ```{r, warning=FALSE, message=FALSE}
 gamelogs <- arrow::read_parquet("qb_gamelogs_pre.parquet")
 
+ewm <- function(x, span) {
+  if (!is.numeric(x)) stop("x must be numeric")
+  if (!is.numeric(span) || span < 1) stop("span must be >= 1")
+
+  n <- length(x)
+  out <- rep(NA_real_, n)
+  if (n == 0) return(out)
+
+  alpha <- 2 / (span + 1)
+
+  non_na_idx <- which(!is.na(x))
+  if (length(non_na_idx) == 0) return(out)  # all NA
+
+  first_idx <- non_na_idx[1]
+
+  # Initialize adjusted EWM state at the first observed value
+  v <- x[first_idx]          # weighted sum of values
+  w <- 1                     # total weight
+  out[first_idx] <- v / w    # equals x[first_idx]
+
+  if (first_idx == n) return(out)
+
+  for (i in seq.int(first_idx + 1, n)) {
+    if (is.na(x[i])) {
+      # Propagate last EMA across NA, but decay internal state
+      v <- (1 - alpha) * v
+      w <- (1 - alpha) * w
+      out[i] <- out[i - 1]      # unchanged (v/w is invariant under equal decay)
+    } else {
+      # Adjusted/bias-corrected update
+      v <- (1 - alpha) * v + x[i]
+      w <- (1 - alpha) * w + 1
+      out[i] <- v / w
+    }
+  }
+  out
+}
+
+
 gamelogs <- gamelogs %>%
-  arrange(season, week) %>%  # Ensure correct order for rolling calculations
+  arrange(season, week) %>%  # Ensure correct temporal order
   group_by(player_display_name) %>%
-  mutate(across(where(is.numeric) & !starts_with("def") & !all_of(c("season", "week")), 
-                ~ lag(rollapply(.x, width=4, 
-                  FUN=function(x) {
-                    alpha <- 2 / (length(x) + 1)  # Compute smoothing factor
-                    Reduce(function(prev, curr) alpha * curr + (1 - alpha) * prev, x, accumulate = TRUE)[length(x)]
-                    },
-                  fill=mean(.x, na.rm=TRUE), align="right", partial=TRUE), 1),  # Exclude current row using lag
-                .names = "roll_{.col}")) %>%
+  mutate(across(where(is.numeric) & 
+                  !starts_with("def") & 
+                  !all_of(c("season", "week")),
+                ~ lag(ewm(.x, span = 3), 1),  # Replace EMA with custom ewm()
+                .names = "ewm_{.col}")) %>%
   ungroup() %>%
   group_by(opponent_team) %>%
-  mutate(across(starts_with("def_"), 
-                ~ lag(rollapply(.x, width=4, 
-                  FUN=function(x) {
-                    alpha <- 2 / (length(x) + 1)  # Compute smoothing factor
-                    Reduce(function(prev, curr) alpha * curr + (1 - alpha) * prev, x, accumulate = TRUE)[length(x)]
-                    },
-                  fill=mean(.x, na.rm=TRUE), align="right", partial=TRUE), 1),  # Exclude current row for defense stats too
-                .names = "roll_{.col}")) %>%
+  mutate(across(starts_with("def_"),
+                ~ lag(ewm(.x, span = 3), 1),  # Replace EMA with custom ewm()
+                .names = "ewm_{.col}")) %>%
   ungroup() %>%
   select(player_display_name, recent_team, season, week, season_type, 
          game_id, game_date, home_away, opponent_team, attempts, completions,
          passing_yards, passing_tds, interceptions, carries, rushing_yards, rushing_tds, 
-         fantasy_points, starts_with("roll_")) %>%
+         fantasy_points, starts_with("ewm_")) %>%
   arrange(game_date, season, week, player_display_name) %>%
-  filter(season >= 2018) %>%
+  filter(season >= 2016) %>%
   filter(attempts >= 15)
-
 cat("Dimensions:", dim(gamelogs))
-cat("Total NAs:", sum(is.na(gamelogs))) # Total NAs in gamelogs
+cat("\nSum of NAs:", sum(is.na(gamelogs))) # Total NAs in gamelogs
 head(gamelogs) # View first few rows of gamelogs
 
 arrow::write_parquet(gamelogs, "qb_gamelogs_post.parquet")
 ```
 
 ## Modeling - Classification
+
 ```{r}
 set.seed(6341) # Set seed for reproducibility
 
@@ -306,6 +338,7 @@ player_test <- testing(player_splits)
 ```
 
 ### Preprocessing Recipe
+
 ```{r}
 id_vars <- c("player_display_name", "recent_team", "season", "week", 
              "game_id", "game_date", "opponent_team")
@@ -332,7 +365,8 @@ nfl_recipe <- recipe(~., data = player_train) %>%
   step_dummy(all_nominal_predictors(), -all_outcomes(), one_hot = TRUE) %>%
   # Remove near-zero variance features
   step_nzv(all_predictors()) %>%
-  step_normalize(all_numeric_predictors())
+  step_normalize(all_numeric_predictors()) %>%
+  step_pca(all_numeric_predictors(), threshold = .95)
 
 rec_prep <- prep(nfl_recipe)
 player_baked <- bake(rec_prep, new_data = NULL)
@@ -341,7 +375,9 @@ player_baked <- bake(rec_prep, new_data = NULL)
 rm(gamelogs)
 gc()
 ```
+
 ### Training
+
 ```{r}
 # Assume player_baked is already sorted by time
 x_mat <- model.matrix(~ ., player_baked %>% select(-all_of(c(target_class_vars, id_vars))))[, -1]
@@ -446,7 +482,9 @@ for (target in target_class_vars) {
 
 saveRDS(final_model, "prob_model.rds")
 ```
+
 ### Model Evaluation
+
 ```{r, warning=FALSE, message=FALSE}
 # Predict on test set
 player_test_baked <- bake(rec_prep, new_data = player_test)
@@ -502,7 +540,9 @@ metrics_df <- purrr::map_dfr(
 metrics_df
 arrow::write_parquet(metrics_df, "prob_metrics.parquet")
 ```
+
 ### Add Class Probabilities
+
 ```{r}
 bin_breaks_list <- list(
   attempts_bin       = c(-Inf, 20, 30, 40, Inf),
@@ -617,7 +657,8 @@ nfl_recipe <- recipe(~., data = player_train) %>%
   step_dummy(all_nominal_predictors(), -all_outcomes(), one_hot = TRUE) %>%
   # Remove near-zero variance features
   step_nzv(all_predictors()) %>%
-  step_normalize(all_numeric_predictors())
+  step_normalize(all_numeric_predictors()) %>%
+  step_pca(all_numeric_predictors(), threshold = 0.95)
 
 rec_prep <- prep(nfl_recipe)
 player_baked <- bake(rec_prep, new_data = NULL)
@@ -650,7 +691,7 @@ rolling_splits <- rolling_origin(
   cumulative = FALSE
 )
 
-lambda_grid <- 10^seq(0.1, -5, length.out = 100)
+lambda_grid <- 10^seq(1, -5, length.out = 100)
 lambda_rmse <- matrix(NA, nrow = length(lambda_grid), ncol = length(rolling_splits$splits))
 
 # Register 10 cores
